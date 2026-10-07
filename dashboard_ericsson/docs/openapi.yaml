@@ -1,0 +1,600 @@
+openapi: 3.0.3
+info:
+  title: FH Saturation API
+  version: 1.0.0
+  description: |
+    Backend of the microwave-link (FH) saturation dashboard.
+
+    **Authentication.** Every route except `GET /health` and `POST /auth/login` needs
+    `Authorization: Bearer <token>`, where the token comes from `POST /auth/login`.
+    Two roles exist: `viewer` (read everything) and `admin` (read everything, import files, revert imports).
+
+    **Errors.** Every error has the same shape (see `Error`): `status`, `code`, `message`, optional `details`, `requestId`.
+    Branch on `code`, never on `message`. The `requestId` is also sent in the `X-Request-Id` response header and
+    appears in the server log.
+
+    **Rate limits.** 300 requests per IP per 15 minutes on the whole API (`/health` excluded), and 10 FAILED logins
+    per IP per 15 minutes (both configurable). Beyond that: `429 RATE_LIMITED` with a `Retry-After` header.
+
+    **Load.** "load" is the 95th percentile of the daily utilization, in percent, of the worst measured link of a site.
+    Conditions: `good` (< 50), `medium` (50 to < 80), `critical` (>= 80), `no_data` (no valid measurement).
+    The thresholds are returned in every dashboard/site answer (`thresholds`).
+
+    Example values in the answers below are illustrative, except the NeId 18870 worked example (its 20 slices, 2192 s above 80 %, P95 62.70).
+servers:
+  - url: http://localhost:3000/api/v1
+tags:
+  - { name: Health }
+  - { name: Auth }
+  - { name: Imports }
+  - { name: Dashboard }
+  - { name: Wilayas }
+  - { name: Sites }
+security:
+  - bearerAuth: []
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Liveness and database state
+      description: Public. Never rate limited.
+      security: []
+      responses:
+        '200':
+          description: The API is running
+          content:
+            application/json:
+              example: { status: success, message: API is running, uptime: 1234, database: connected }
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in and get a token
+      description: Public. Counts against the failed-login rate limit only when it fails.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+            example: { email: admin@example.com, password: a-long-enough-password }
+      responses:
+        '200':
+          description: Logged in. The token is a JWT (HS256) valid for JWT_EXPIRES_IN (default 1 day).
+          content:
+            application/json:
+              example:
+                status: success
+                token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+                data: { user: { id: 665f1c2e8f1b2a0012a4c001, email: admin@example.com, role: admin } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Wrong email or password (the same answer for an unknown email and for a wrong password), or disabled account
+          content:
+            application/json:
+              example: { status: fail, code: INVALID_CREDENTIALS, message: Incorrect email or password, requestId: 0b0f5d0e-3c52-4a3b-9d5e-2a1f6c7e8b90 }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: The logged-in user (also a cheap way to check a token)
+      responses:
+        '200':
+          description: The user of the token
+          content:
+            application/json:
+              example: { status: success, data: { user: { id: 665f1c2e8f1b2a0012a4c001, email: viewer@example.com, role: viewer } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /imports:
+    get:
+      tags: [Imports]
+      summary: Import history, newest first
+      description: Roles viewer and admin. Only successful imports are listed.
+      parameters:
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/Limit100' }
+      responses:
+        '200':
+          description: One page of imports. `number` is the order of arrival (1 = oldest).
+          content:
+            application/json:
+              example:
+                status: success
+                results: 1
+                total: 1
+                page: 1
+                pages: 1
+                data:
+                  imports:
+                    - number: 1
+                      id: 665f1c2e8f1b2a0012a4c010
+                      fileName: congestion_data.xlsx
+                      fileType: xlsx
+                      importedAt: '2026-02-16T08:30:00.000Z'
+                      status: successful
+                      counts: { rowsTotal: 1200, valid: 862, failed: 338, rejected: 0, skipped: 0, withWarnings: 56 }
+                      sitesCount: 1194
+                      periodFrom: '2026-02-10T00:00:00.000Z'
+                      periodTo: '2026-02-15T00:00:00.000Z'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Imports]
+      summary: Upload and import a file
+      description: |
+        **Admin only.** One request does the whole pipeline: upload, read, validate, prepare, store.
+        It either succeeds completely or leaves nothing behind (a failed import never appears in the history).
+
+        The file is kept in memory only, never written to disk. Limits: one file, field name `file`,
+        `.xlsx` or `.csv`, 10 MB maximum. The file is fingerprinted (SHA-256): the same file cannot be imported twice.
+        Rows whose (link, day) already exist from an earlier import are skipped (reported as `DUPLICATE_OF_EXISTING` warnings).
+        Columns are located by header name: NeId, NeType, EntityType, MeasurePoint, EndTime (dd/mm/yyyy hh:mm:ss),
+        Failure, Avg, Max, Min and the 20 bins `0-5` ... `95-100`.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '201':
+          description: Imported
+          content:
+            application/json:
+              example:
+                status: success
+                message: Import completed successfully
+                data:
+                  import:
+                    id: 665f1c2e8f1b2a0012a4c010
+                    fileName: congestion_data.xlsx
+                    fileType: xlsx
+                    importedAt: '2026-02-16T08:30:00.000Z'
+                    status: successful
+                    counts: { rowsTotal: 1200, valid: 862, failed: 338, rejected: 0, skipped: 0, withWarnings: 56 }
+                    sitesCount: 1194
+                    periodFrom: '2026-02-10T00:00:00.000Z'
+                    periodTo: '2026-02-15T00:00:00.000Z'
+        '400':
+          description: No file (`UPLOAD_MISSING`), several files or a wrong field name (`UPLOAD_INVALID`), broken multipart body (`UPLOAD_MALFORMED`)
+          content:
+            application/json:
+              example: { status: fail, code: UPLOAD_MISSING, message: 'Please send a file in the form-data field named "file"', requestId: 0b0f5d0e-3c52-4a3b-9d5e-2a1f6c7e8b90 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: |
+            `IMPORT_DUPLICATE_FILE` (same file already imported; `details` has the import id),
+            `IMPORT_IN_PROGRESS` (same file being imported right now),
+            `IMPORT_NOTHING_NEW` (every row already exists from earlier imports).
+          content:
+            application/json:
+              example:
+                status: fail
+                code: IMPORT_DUPLICATE_FILE
+                message: This file was already imported on 2026-02-16T08:30:00.000Z (import 665f1c2e8f1b2a0012a4c010)
+                details: { importId: 665f1c2e8f1b2a0012a4c010, importedAt: '2026-02-16T08:30:00.000Z' }
+                requestId: 0b0f5d0e-3c52-4a3b-9d5e-2a1f6c7e8b90
+        '413':
+          description: File above 10 MB (`FILE_TOO_LARGE`)
+          content:
+            application/json:
+              example: { status: fail, code: FILE_TOO_LARGE, message: File too large (maximum 10 MB), requestId: 0b0f5d0e-3c52-4a3b-9d5e-2a1f6c7e8b90 }
+        '415':
+          description: Extension other than .xlsx / .csv (`UNSUPPORTED_FILE_TYPE`)
+          content:
+            application/json:
+              example: { status: fail, code: UNSUPPORTED_FILE_TYPE, message: Only .xlsx and .csv files are accepted, requestId: 0b0f5d0e-3c52-4a3b-9d5e-2a1f6c7e8b90 }
+        '422':
+          description: |
+            The file is readable as a request but not importable: `EXCEL_UNREADABLE` (not a real workbook),
+            `EXCEL_NO_SHEET`, `EXCEL_MISSING_COLUMNS` (`details.missing` lists them), `IMPORT_EMPTY_FILE`,
+            `IMPORT_ALL_ROWS_REJECTED`.
+          content:
+            application/json:
+              example:
+                status: fail
+                code: EXCEL_MISSING_COLUMNS
+                message: 'Required column(s) missing: MeasurePoint'
+                details: { missing: [MeasurePoint] }
+                requestId: 0b0f5d0e-3c52-4a3b-9d5e-2a1f6c7e8b90
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /imports/{id}:
+    get:
+      tags: [Imports]
+      summary: 'One import: summary, issue totals, and the days it covers'
+      parameters:
+        - { $ref: '#/components/parameters/ImportId' }
+      responses:
+        '200':
+          description: The import
+          content:
+            application/json:
+              example:
+                status: success
+                data:
+                  import:
+                    number: 1
+                    id: 665f1c2e8f1b2a0012a4c010
+                    fileName: congestion_data.xlsx
+                    fileType: xlsx
+                    importedAt: '2026-02-16T08:30:00.000Z'
+                    status: successful
+                    counts: { rowsTotal: 1200, valid: 862, failed: 338, rejected: 0, skipped: 0, withWarnings: 56 }
+                    sitesCount: 1194
+                    periodFrom: '2026-02-10T00:00:00.000Z'
+                    periodTo: '2026-02-15T00:00:00.000Z'
+                    issues: { errors: 0, warnings: 56, byCode: { NEID_MULTIPLE_NETYPE: 56 } }
+                    days: [{ date: '2026-02-10', total: 200, valid: 144, failed: 56 }]
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Imports]
+      summary: Cancel (revert) an import
+      description: |
+        **Admin only.** Removes what the import brought: its measurements and issues, then the links and sites
+        that no other import uses (data of earlier imports is never touched). The import disappears from the
+        history and the same file can be imported again.
+
+        Safe to repeat: the second call is `404`. Two calls at the same time: one does the work, the other
+        gets `404` or `409`. If the server stops half-way the import stays hidden in a `reverting` state; call
+        DELETE again (it answers `409 IMPORT_REVERT_IN_PROGRESS` for 5 minutes, then resumes and finishes).
+      parameters:
+        - { $ref: '#/components/parameters/ImportId' }
+      responses:
+        '200':
+          description: Reverted. `removed` counts the deleted documents.
+          content:
+            application/json:
+              example:
+                status: success
+                message: Import reverted
+                data: { id: 665f1c2e8f1b2a0012a4c010, removed: { measurements: 1200, issues: 56, links: 1200, sites: 1194 } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Still being imported (`IMPORT_IN_PROGRESS`) or already being reverted (`IMPORT_REVERT_IN_PROGRESS`)
+          content:
+            application/json:
+              example: { status: fail, code: IMPORT_REVERT_IN_PROGRESS, message: This import is already being reverted, requestId: 0b0f5d0e-3c52-4a3b-9d5e-2a1f6c7e8b90 }
+
+  /imports/{id}/rows:
+    get:
+      tags: [Imports]
+      summary: The stored rows of an import (preview)
+      parameters:
+        - { $ref: '#/components/parameters/ImportId' }
+        - { $ref: '#/components/parameters/Page' }
+        - name: limit
+          in: query
+          description: Rows per page (default 50, maximum 200)
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: filter
+          in: query
+          description: '`valid` = measured rows, `failed` = PM failure rows'
+          schema: { type: string, enum: [all, valid, failed], default: all }
+        - name: q
+          in: query
+          description: A NeId (digits only, exact match)
+          schema: { type: string, pattern: '^\d+$' }
+      responses:
+        '200':
+          description: One page of rows, in file order
+          content:
+            application/json:
+              example:
+                status: success
+                results: 1
+                total: 862
+                page: 1
+                pages: 862
+                data:
+                  rows:
+                    - sourceRow: 2
+                      neId: 18870
+                      neType: AMM 20PB
+                      wilayaCode: 18
+                      measurePoint: "1/11/106 'To_2238',PacketLinks=1/17/1,1/18/1"
+                      portRef: 1/11/106
+                      label: To_2238
+                      notInUse: false
+                      entityType: MLTN WAN Eth Bandwidth RX
+                      endTime: '2026-02-10T00:00:00.000Z'
+                      status: OK
+                      failure: null
+                      avgRaw: 5
+                      maxRaw: 9
+                      minRaw: 1
+                      bins: [50948, 16487, 5770, 2966, 584, 967, 895, 507, 677, 584, 543, 898, 470, 650, 636, 626, 575, 432, 701, 484]
+                      totalSeconds: 86400
+                      meanUtil: 11.17
+                      p95: 62.7
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /imports/{id}/issues:
+    get:
+      tags: [Imports]
+      summary: Validation issues found while importing
+      parameters:
+        - { $ref: '#/components/parameters/ImportId' }
+        - { $ref: '#/components/parameters/Page' }
+        - name: limit
+          in: query
+          description: Issues per page (default 50, maximum 200)
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: severity
+          in: query
+          schema: { type: string, enum: [error, warning] }
+        - name: code
+          in: query
+          description: An upper-case issue code, e.g. NEID_MULTIPLE_NETYPE, DUPLICATE_OF_EXISTING, WILAYA_UNKNOWN
+          schema: { type: string, pattern: '^[A-Z_]+$' }
+      responses:
+        '200':
+          description: One page of issues
+          content:
+            application/json:
+              example:
+                status: success
+                results: 1
+                total: 56
+                page: 1
+                pages: 56
+                data:
+                  issues:
+                    - { sourceRow: 17, severity: warning, code: NEID_MULTIPLE_NETYPE, message: NeId 2301 appears with 2 different NeType values }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /dashboard:
+    get:
+      tags: [Dashboard]
+      summary: Site distribution, top and bottom sites, top wilayas
+      description: |
+        The state of every site is its most recent day with data (inside the requested scope), and on that day the
+        load of its worst link. A site whose links all failed that day is `no_data`: it is counted but never ranked.
+      parameters:
+        - { $ref: '#/components/parameters/ScopeImport' }
+        - { $ref: '#/components/parameters/ScopeDate' }
+        - name: limit
+          in: query
+          description: Size of the top/bottom lists (default 10, maximum 50)
+          schema: { type: integer, minimum: 1, maximum: 50, default: 10 }
+        - name: wilayaLimit
+          in: query
+          description: Number of wilayas in the ranking (default 5, maximum 58)
+          schema: { type: integer, minimum: 1, maximum: 58, default: 5 }
+      responses:
+        '200':
+          description: The dashboard
+          content:
+            application/json:
+              example:
+                status: success
+                data:
+                  scope: { import: null, asOf: null, latestUpdate: '2026-02-15T00:00:00.000Z' }
+                  thresholds: { metric: p95, mediumFrom: 50, criticalFrom: 80 }
+                  totals: { sites: 1194, measured: 900, noData: 294 }
+                  byCondition:
+                    critical: { count: 69, share: 0.0578 }
+                    medium: { count: 120, share: 0.1005 }
+                    good: { count: 711, share: 0.5955 }
+                    no_data: { count: 294, share: 0.2462 }
+                  topSites:
+                    - { siteId: 665f1c2e8f1b2a0012a4c101, neId: 18870, neType: AMM 20PB, wilayaCode: 18, wilayaName: Jijel, load: 89.75, condition: critical, noMeasurementReason: null, lastUpdate: '2026-02-15T00:00:00.000Z' }
+                  bottomSites: []
+                  wilayas:
+                    criticalSites: 69
+                    top:
+                      - { wilayaCode: 16, name: Alger, total: 80, measured: 60, critical: 9, rate: 0.1125, shareOfCritical: 0.1304 }
+                    unassigned: { sites: 0, critical: 0 }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /wilayas:
+    get:
+      tags: [Wilayas]
+      summary: Wilayas that contain at least one site (for the "All wilayas" filter)
+      description: The wilaya code of a site is derived from its NeId (5 digits = first two, 4 digits = first one).
+      responses:
+        '200':
+          description: The wilayas
+          content:
+            application/json:
+              example:
+                status: success
+                results: 29
+                data:
+                  wilayas: [{ code: 16, name: Alger, sites: 80 }]
+                  unassignedSites: 0
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /sites:
+    get:
+      tags: [Sites]
+      summary: All sites with filters, sorting and pagination
+      description: Sites without a measurement (`no_data`) always come last, whichever sort direction is chosen.
+      parameters:
+        - name: neId
+          in: query
+          description: Start of a NeId (digits only), e.g. 188 finds 18870
+          schema: { type: string, pattern: '^\d{1,9}$' }
+        - name: wilaya
+          in: query
+          description: Wilaya code (1 to 99)
+          schema: { type: integer, minimum: 1, maximum: 99 }
+        - name: condition
+          in: query
+          schema: { type: string, enum: [critical, medium, good, no_data] }
+        - name: sort
+          in: query
+          schema: { type: string, enum: [load_desc, load_asc], default: load_desc }
+        - { $ref: '#/components/parameters/ScopeImport' }
+        - { $ref: '#/components/parameters/ScopeDate' }
+        - { $ref: '#/components/parameters/Page' }
+        - name: limit
+          in: query
+          description: Sites per page (default 100, maximum 200)
+          schema: { type: integer, minimum: 1, maximum: 200, default: 100 }
+      responses:
+        '200':
+          description: One page of sites
+          content:
+            application/json:
+              example:
+                status: success
+                results: 1
+                total: 1194
+                page: 1
+                pages: 12
+                from: 1
+                to: 1
+                data:
+                  scope: { import: null, asOf: null }
+                  thresholds: { metric: p95, mediumFrom: 50, criticalFrom: 80 }
+                  sites:
+                    - { siteId: 665f1c2e8f1b2a0012a4c101, neId: 18870, neType: AMM 20PB, wilayaCode: 18, wilayaName: Jijel, load: 89.75, condition: critical, noMeasurementReason: null, lastUpdate: '2026-02-15T00:00:00.000Z' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /sites/{id}:
+    get:
+      tags: [Sites]
+      summary: One site - current state, 7-day history, links with their 20-slice histogram, and the report text
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The `siteId` returned by the list
+          schema: { type: string, pattern: '^[a-f0-9]{24}$' }
+        - { $ref: '#/components/parameters/ScopeImport' }
+        - { $ref: '#/components/parameters/ScopeDate' }
+      responses:
+        '200':
+          description: The site page. `links[].bins` is the histogram (20 slices of 5 % utilization, in seconds).
+          content:
+            application/json:
+              example:
+                status: success
+                data:
+                  scope: { import: null, asOf: null }
+                  thresholds: { metric: p95, mediumFrom: 50, criticalFrom: 80 }
+                  site: { id: 665f1c2e8f1b2a0012a4c101, neId: 18870, neType: AMM 20PB, wilayaCode: 18, wilayaName: Jijel }
+                  current: { lastUpdate: '2026-02-15T00:00:00.000Z', load: 89.75, condition: critical, failureReasons: [], noMeasurementReason: null }
+                  summary: { windowDays: 6, measuredDays: 6, average: 70.1, maximum: 89.75, minimum: 62.7 }
+                  history: [{ date: '2026-02-10', load: 62.7, condition: medium, measuredLinks: 1, totalLinks: 1 }]
+                  links:
+                    - linkId: 665f1c2e8f1b2a0012a4c201
+                      measurePoint: "1/11/106 'To_2238',PacketLinks=1/17/1,1/18/1"
+                      portRef: 1/11/106
+                      label: To_2238
+                      notInUse: false
+                      entityType: MLTN WAN Eth Bandwidth RX
+                      endTime: '2026-02-15T00:00:00.000Z'
+                      status: OK
+                      failure: null
+                      load: 89.75
+                      bins: [50948, 16487, 5770, 2966, 584, 967, 895, 507, 677, 584, 543, 898, 470, 650, 636, 626, 575, 432, 701, 484]
+                      onLatestDay: true
+                      isWorst: true
+                  report: { level: critical, title: Critical, text: Critical load. ... }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    ImportId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, pattern: '^[a-f0-9]{24}$' }
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    Limit100:
+      name: limit
+      in: query
+      description: Items per page (default 20, maximum 100)
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    ScopeImport:
+      name: import
+      in: query
+      description: Restrict to the measurements of one import (id from the history)
+      schema: { type: string, pattern: '^[a-f0-9]{24}$' }
+    ScopeDate:
+      name: date
+      in: query
+      description: '"State as of that day" (YYYY-MM-DD, a real calendar date): only measurements up to the end of that day'
+      schema: { type: string, format: date }
+  schemas:
+    Error:
+      type: object
+      required: [status, code, message, requestId]
+      properties:
+        status: { type: string, enum: [fail, error], description: '`fail` = the client can fix it (4xx), `error` = server side (5xx)' }
+        code: { type: string, description: Stable machine-readable code }
+        message: { type: string, description: Human-readable text }
+        details: { type: object, description: Optional extra data (e.g. the missing columns) }
+        requestId: { type: string, format: uuid }
+  responses:
+    BadRequest:
+      description: |
+        A parameter is invalid. Codes: `BAD_REQUEST`, `VALIDATION_ERROR`, `MALFORMED_JSON`, `INVALID_VALUE`.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { status: fail, code: BAD_REQUEST, message: '"page" must be a positive integer', requestId: 0b0f5d0e-3c52-4a3b-9d5e-2a1f6c7e8b90 }
+    Unauthorized:
+      description: |
+        No, invalid or expired token. Codes: `TOKEN_MISSING`, `TOKEN_INVALID`, `TOKEN_EXPIRED`, `ACCOUNT_DISABLED`.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { status: fail, code: TOKEN_MISSING, message: You are not logged in. Please log in to get access, requestId: 0b0f5d0e-3c52-4a3b-9d5e-2a1f6c7e8b90 }
+    Forbidden:
+      description: The role of the user is not allowed to do this (`FORBIDDEN`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { status: fail, code: FORBIDDEN, message: You do not have permission to perform this action, requestId: 0b0f5d0e-3c52-4a3b-9d5e-2a1f6c7e8b90 }
+    NotFound:
+      description: The import, site or route does not exist (`NOT_FOUND`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { status: fail, code: NOT_FOUND, message: No import found with that id, requestId: 0b0f5d0e-3c52-4a3b-9d5e-2a1f6c7e8b90 }
+    TooManyRequests:
+      description: Rate limit reached (`RATE_LIMITED`). Wait for `Retry-After` seconds.
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { status: fail, code: RATE_LIMITED, message: Too many requests. Please wait a few minutes and try again, requestId: 0b0f5d0e-3c52-4a3b-9d5e-2a1f6c7e8b90 }

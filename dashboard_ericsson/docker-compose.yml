@@ -1,0 +1,19 @@
+# Local MongoDB for development and tests:  docker compose up -d
+# It is a standalone server (no replica set), which is all the backend needs.
+services:
+  mongo:
+    image: mongo:8
+    container_name: fh-saturation-mongo
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:27017:27017" # reachable from this machine only
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mongo-data:
